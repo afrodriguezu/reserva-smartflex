@@ -1,0 +1,4 @@
+# El runner de Actions es Linux: los archivos van a LF en el repositorio
+# aunque en Windows se vean con CRLF. Evita que instalar.sh falle con
+# "\r: command not found" si alguna vez se corre en bash.
+* text=auto eol=lf
