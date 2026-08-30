@@ -1,0 +1,16 @@
+{
+  "subnivel": "A1.2",
+  "clase": "11",
+  "hora": "19:00",
+  "horas_sugeridas": [
+    "17:00",
+    "19:00",
+    "20:00"
+  ],
+  "max_clase": null,
+  "duracion_clase_horas": 2,
+  "ventana_comandos_horas": 2,
+  "reservar_alternativa": false,
+  "sin_clases_domingo": true,
+  "sin_clases_festivos": true
+}
