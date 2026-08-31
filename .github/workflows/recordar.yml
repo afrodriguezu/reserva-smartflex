@@ -9,7 +9,10 @@ permissions:
   contents: write
 
 concurrency:
-  group: escuchar
+  # Grupo propio: si compartiera el de escuchar.yml, una corrida de escuchar
+  # que llegue mientras esta espera la cancelaria y se perderia el
+  # recordatorio de las 9:20, que es la corrida mas importante del dia.
+  group: recordar
   cancel-in-progress: false
 
 jobs:
@@ -31,11 +34,33 @@ jobs:
       - name: Guardar estado
         if: always()
         run: |
-          if [[ -n "$(git status --porcelain estado.json)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add estado.json
-            git commit -m "estado: recordatorio"
-            git pull --rebase --autostash
-            git push
+          if [[ -z "$(git status --porcelain estado.json)" ]]; then
+            echo "estado.json sin cambios"
+            exit 0
           fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          MENSAJE="estado: recordatorio"
+          git add estado.json
+          git commit -m "$MENSAJE"
+          # Si otra corrida empujo primero, gana la version del bot que acaba
+          # de correr: se trae lo remoto, se reimpone estado.json y se reintenta.
+          for intento in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "push rechazado, reintento $intento"
+            cp estado.json /tmp/estado.json
+            git fetch origin main
+            git reset --hard FETCH_HEAD
+            cp /tmp/estado.json estado.json
+            if [[ -z "$(git status --porcelain estado.json)" ]]; then
+              echo "la otra corrida ya guardo lo mismo, no hay nada que empujar"
+              exit 0
+            fi
+            git add estado.json
+            git commit -m "$MENSAJE"
+            sleep $((RANDOM % 4 + 2))
+          done
+          echo "No pude guardar estado.json despues de 3 intentos"
+          exit 1
