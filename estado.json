@@ -2,7 +2,13 @@
   "ultima_clase_reservada": 11,
   "ultima_clase_vista": 20,
   "subnivel": "A1.3",
-  "ultimo_update_procesado": 349438679,
-  "cita": null,
+  "ultimo_update_procesado": 349438680,
+  "cita": {
+    "cuando": "2026-10-02 00:15",
+    "subnivel": "A1.3",
+    "clase": "21",
+    "hora": "17:00",
+    "para": "2026-10-03"
+  },
   "propuesta": null
 }
