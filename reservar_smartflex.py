@@ -60,6 +60,19 @@ TEXTO_NO = "No reservar"
 TEXTO_CANCELAR = "Cancelar reserva"
 TEXTO_ESTADO = "Ver estado"
 
+# Los cupos de un dia abren a las 00:15 del dia anterior.
+HORA_APERTURA = (0, 15)
+
+# Por que puede fallar una reserva. Son tres cosas distintas y se reportan asi.
+CAUSA_SIN_CUPOS = "sin cupos"
+CAUSA_CONSULTA = "error de consulta"
+CAUSA_RESERVA = "error al reservar"
+
+
+class ErrorConsulta(Exception):
+    """El sistema respondio, pero con un error o con algo que no se puede leer
+    como lista de cupos. No es lo mismo que 'no hay cupos'."""
+
 
 # ---------------------------------------------------------- utilidades
 
@@ -157,12 +170,51 @@ def proximo_dia_habil(desde, cfg):
     return desde
 
 
+# ---------------------------------------------------------- apertura de cupos
+
+def apertura_de(objetivo):
+    """Momento en que abren los cupos del dia `objetivo`: 00:15 del dia anterior."""
+    v = objetivo - timedelta(days=1)
+    return datetime(v.year, v.month, v.day, *HORA_APERTURA, tzinfo=TZ)
+
+
+def hace_cuanto(desde, hasta):
+    mins = int((hasta - desde).total_seconds() // 60)
+    return f"{mins} min" if mins < 120 else f"{mins // 60} h"
+
+
+def dia_de_entrada(apertura, ahora):
+    """Como escribir ese dia en el comando 'entra ...'. Si es hoy se dice 'hoy':
+    con el nombre del dia, interpretar_dia() lo mandaria a la semana siguiente."""
+    if apertura.date() == ahora.date():
+        return "hoy"
+    return f"el {DIAS[apertura.weekday()]}"
+
+
 # ---------------------------------------------------------- API de reservas
+
+def _json(r, accion):
+    """r.json() que deja en el log que llego cuando no es JSON (pagina de error
+    de Google, cuota excedida...), para no diagnosticar a ciegas."""
+    try:
+        return r.json()
+    except ValueError:
+        log(f"{accion}: la respuesta no es JSON: {r.text[:200]!r}")
+        raise
+
+
+def _resumen(obj, limite=300):
+    try:
+        txt = json.dumps(obj, ensure_ascii=False)
+    except (TypeError, ValueError):
+        txt = repr(obj)
+    return txt if len(txt) <= limite else txt[:limite] + "..."
+
 
 def api_get(action, **params):
     r = requests.get(API, params={"api": "1", "action": action, **params}, timeout=TIMEOUT)
     r.raise_for_status()
-    return r.json()
+    return _json(r, action)
 
 
 def api_post(action, **payload):
@@ -170,7 +222,7 @@ def api_post(action, **payload):
                       headers={"Content-Type": "text/plain;charset=utf-8"},
                       data=json.dumps({"action": action, **payload}), timeout=TIMEOUT)
     r.raise_for_status()
-    return r.json()
+    return _json(r, action)
 
 
 def reserva_activa(documento):
@@ -245,10 +297,40 @@ def hora_del_slot(slot):
 
 
 def obtener_slots(subnivel, fecha):
-    slots = api_get("getSlotsForDate", subnivel=subnivel, dateStr=fecha)
-    if isinstance(slots, dict):
-        slots = slots.get("slots") or slots.get("result") or []
-    return slots or []
+    """Cupos de un dia.
+
+    Devuelve una lista, que esta vacia SOLO si el sistema dijo de forma valida
+    que no hay cupos. Si la respuesta es un error o no se entiende, lanza
+    ErrorConsulta: antes todo eso se convertia en [] y se reportaba como
+    'no hay cupo. Disponibles: ninguna', aunque si los hubiera.
+    """
+    try:
+        resp = api_get("getSlotsForDate", subnivel=subnivel, dateStr=fecha)
+    except ValueError as e:                      # la respuesta no era JSON
+        raise ErrorConsulta(f"la respuesta del sistema no es JSON ({str(e)[:80]})")
+
+    lista = None
+    if isinstance(resp, dict):
+        if resp.get("ok") is False or resp.get("error"):
+            raise ErrorConsulta("el sistema respondio con error: "
+                                f"{resp.get('error') or resp.get('message') or 'ok=false'}")
+        for clave in ("slots", "result"):
+            if clave in resp:
+                lista = resp[clave] if resp[clave] is not None else []
+                break
+        else:
+            # Otra clave: solo se acepta si la respuesta trae una unica lista.
+            listas = [v for v in resp.values() if isinstance(v, list)]
+            if len(listas) == 1:
+                lista = listas[0]
+    elif isinstance(resp, list):
+        lista = resp
+
+    if not isinstance(lista, list) or not all(isinstance(s, dict) for s in lista):
+        raise ErrorConsulta(f"respuesta sin lista de cupos reconocible: {_resumen(resp)}")
+    if not lista:
+        log(f"getSlotsForDate {subnivel} {fecha}: lista vacia. Respuesta: {_resumen(resp)}")
+    return lista
 
 
 # ---------------------------------------------------------- Telegram entrante
@@ -451,11 +533,18 @@ def reservar_ahora(cfg, estado, documento, subnivel, clase, hora, fecha_obj):
 
     fecha = fecha_obj.strftime("%Y-%m-%d")
     alternativa = bool(cfg.get("reservar_alternativa", False))
-    ultimo_error = None
+    causa, detalle = CAUSA_CONSULTA, "no se llego a consultar"
 
     for intento in range(1, INTENTOS + 1):
+        # 1) Consultar cupos. Un error aqui NO significa "no hay cupos".
         try:
-            disponibles = {hora_del_slot(s): s for s in obtener_slots(subnivel, fecha)}
+            lista = obtener_slots(subnivel, fecha)
+        except (requests.RequestException, ValueError, ErrorConsulta) as e:
+            causa, detalle = CAUSA_CONSULTA, str(e)[:300]
+            lista = None
+
+        if lista is not None:
+            disponibles = {hora_del_slot(s): s for s in lista}
             log(f"Intento {intento} para {fecha}: {sorted(disponibles) or 'sin horas'}")
 
             elegido, hora_final = disponibles.get(hora), hora
@@ -464,36 +553,53 @@ def reservar_ahora(cfg, estado, documento, subnivel, clase, hora, fecha_obj):
                 elegido = disponibles[hora_final]
 
             if elegido:
-                res = api_post("book", subnivel=subnivel, slotId=elegido.get("slotId"),
-                               email=email, clase=clase,
-                               slotIso=elegido.get("isoBogota", ""),
-                               userTz="America/Bogota", dispositivo_id=device_id(),
-                               documento=documento, name=nombre)
-                if res.get("ok"):
-                    if str(clase).isdigit():
-                        estado["ultima_clase_reservada"] = int(clase)
-                        estado["subnivel"] = subnivel
-                    guardar_estado(estado)
-                    extra = "" if hora_final == hora else f"\n(no habia a las {hora}, tome esta)"
-                    enviar(f"RESERVADO\n{subnivel} clase {clase}\n"
-                           f"{fecha_bonita(fecha_obj)} a las {hora_final}\n"
-                           f"id: {res.get('bookingId','')}{extra}")
-                    return True
-                if res.get("booking"):
-                    enviar("No reserve: el sistema reporta una reserva activa tuya.")
-                    return False
-                ultimo_error = res.get("error", "rechazado sin detalle")
+                # 2) Reservar. Un error aqui tampoco significa "no hay cupos".
+                try:
+                    res = api_post("book", subnivel=subnivel, slotId=elegido.get("slotId"),
+                                   email=email, clase=clase,
+                                   slotIso=elegido.get("isoBogota", ""),
+                                   userTz="America/Bogota", dispositivo_id=device_id(),
+                                   documento=documento, name=nombre)
+                except (requests.RequestException, ValueError) as e:
+                    causa, detalle = CAUSA_RESERVA, f"fallo al enviar la reserva ({str(e)[:200]})"
+                else:
+                    if res.get("ok"):
+                        if str(clase).isdigit():
+                            estado["ultima_clase_reservada"] = int(clase)
+                            estado["subnivel"] = subnivel
+                        guardar_estado(estado)
+                        extra = "" if hora_final == hora else f"\n(no habia a las {hora}, tome esta)"
+                        enviar(f"RESERVADO\n{subnivel} clase {clase}\n"
+                               f"{fecha_bonita(fecha_obj)} a las {hora_final}\n"
+                               f"id: {res.get('bookingId','')}{extra}")
+                        return True
+                    if res.get("booking"):
+                        enviar("No reserve: el sistema reporta una reserva activa tuya.")
+                        return False
+                    causa, detalle = CAUSA_RESERVA, str(res.get("error", "rechazado sin detalle"))
+            elif disponibles:
+                causa = CAUSA_SIN_CUPOS
+                detalle = (f"no hay cupo a las {hora}. "
+                           f"Disponibles: {', '.join(sorted(disponibles))}")
             else:
-                ultimo_error = (f"no hay cupo a las {hora}. Disponibles: "
-                                f"{', '.join(sorted(disponibles)) if disponibles else 'ninguna'}")
-        except requests.RequestException as e:
-            ultimo_error = f"error de conexion ({e})"
+                # Consulta valida y sin cupos. Se compara con la hora de apertura
+                # real antes de decir si ya deberian estar publicados.
+                causa = CAUSA_SIN_CUPOS
+                apertura = apertura_de(fecha_obj)
+                ahora = datetime.now(TZ)
+                detalle = ("el sistema respondio bien pero no devolvio ningun cupo para el "
+                           f"{fecha_bonita(fecha_obj)}; su agenda "
+                           + (f"todavia no abre: abre el {fecha_bonita(apertura)} a las "
+                              f"{apertura:%H:%M}" if apertura > ahora else
+                              f"deberia estar abierta desde el {fecha_bonita(apertura)} a las "
+                              f"{apertura:%H:%M} (hace {hace_cuanto(apertura, ahora)})"))
 
+        log(f"Intento {intento}/{INTENTOS} fallido -> {causa}: {detalle}")
         if intento < INTENTOS:
             time.sleep(ESPERA)
 
     enviar(f"NO RESERVADO\n{subnivel} clase {clase} - {fecha_bonita(fecha_obj)} a las {hora}\n"
-           f"Motivo: {ultimo_error}\n(ejecutado {datetime.now(TZ):%H:%M})")
+           f"Causa: {causa}\nMotivo: {detalle}\n(ejecutado {datetime.now(TZ):%H:%M})")
     return False
 
 
@@ -610,11 +716,13 @@ def menu(cfg, estado, documento, encabezado, objetivo=None, subnivel=None, clase
               f"Reservaria para el {fecha_bonita(objetivo)}.{nota}")
 
     # Horas reales del sistema, no una lista fija.
+    motivo_consulta = ""
     try:
         reales = sorted({hora_del_slot(s)
                          for s in obtener_slots(subnivel, objetivo.strftime("%Y-%m-%d"))})
-    except (requests.RequestException, ValueError) as e:
+    except (requests.RequestException, ValueError, ErrorConsulta) as e:
         log(f"No pude consultar horarios: {e}")
+        motivo_consulta = str(e)[:200]
         reales = None
 
     if reales is None:
@@ -622,21 +730,39 @@ def menu(cfg, estado, documento, encabezado, objetivo=None, subnivel=None, clase
         botones = [sugeridas[i:i + 3] for i in range(0, len(sugeridas), 3)]
         botones.append([TEXTO_NO, TEXTO_ESTADO])
         recordar_propuesta(estado, subnivel, clase, objetivo)
-        enviar(f"{cabeza}\n\nNo pude consultar los horarios ahora. "
+        enviar(f"{cabeza}\n\nNo pude consultar los horarios ahora ({motivo_consulta}). "
                "Dime una hora e igual lo intento.", botones=botones)
         return
 
     if not reales:
-        vispera = objetivo - timedelta(days=1)
-        dia_v = DIAS[vispera.weekday()]
-        sugeridas = (cfg.get("horas_sugeridas") or [cfg["hora"]])[:3]
-        opciones = [f"entra el {dia_v} 00:15 {h}" for h in sugeridas]
-        enviar(f"{cabeza}\n\nTodavia no hay ningun horario publicado para ese dia. "
-               "Los cupos abren la madrugada anterior.\n\n"
-               "Dejame una cita y entro apenas los abran. Necesito que me digas "
-               "la hora de la clase, porque a esa hora tu estas dormido:\n"
-               + "\n".join(f"  {o}" for o in opciones),
-               botones=[[o] for o in opciones] + [[TEXTO_ESTADO]])
+        # La consulta fue valida y no trajo cupos. Antes de decir "todavia no
+        # estan publicados" se compara con la hora real de apertura: si ya paso,
+        # eso no puede ser cierto y tampoco tiene sentido proponer entrar a una
+        # hora pasada.
+        ahora = datetime.now(TZ)
+        apertura = apertura_de(objetivo)
+        if apertura > ahora:
+            dia_e = dia_de_entrada(apertura, ahora)
+            sugeridas = (cfg.get("horas_sugeridas") or [cfg["hora"]])[:3]
+            opciones = [f"entra {dia_e} 00:15 {h}" for h in sugeridas]
+            enviar(f"{cabeza}\n\nTodavia no hay ningun horario publicado para ese dia: "
+                   f"los cupos abren el {fecha_bonita(apertura)} a las {apertura:%H:%M}.\n\n"
+                   "Dejame una cita y entro apenas los abran. Necesito que me digas "
+                   "la hora de la clase, porque a esa hora tu estas dormido:\n"
+                   + "\n".join(f"  {o}" for o in opciones),
+                   botones=[[o] for o in opciones] + [[TEXTO_ESTADO]])
+        else:
+            sugeridas = cfg.get("horas_sugeridas") or [cfg["hora"]]
+            botones = [sugeridas[i:i + 3] for i in range(0, len(sugeridas), 3)]
+            botones.append([TEXTO_NO, TEXTO_ESTADO])
+            recordar_propuesta(estado, subnivel, clase, objetivo)
+            enviar(f"{cabeza}\n\nEl sistema respondio bien pero no muestra ningun cupo libre "
+                   f"para ese dia. Su agenda abrio el {fecha_bonita(apertura)} a las "
+                   f"{apertura:%H:%M} (hace {hace_cuanto(apertura, ahora)}), asi que ya "
+                   "deberia estar publicada: puede estar llena o el sistema no la esta "
+                   "mostrando.\n"
+                   "No lo doy por hecho: dime una hora e igual lo intento.",
+                   botones=botones)
         return
 
     visibles = reales[:9]
@@ -725,6 +851,22 @@ def atender(cfg, estado, documento, texto):
                    f"Escribeme por ejemplo:\n  entra el {DIAS[dia.weekday()]} {h_entrada} 19:00\n\n"
                    f"La primera hora es cuando entro a buscar; la segunda es la "
                    f"clase del {fecha_bonita(destino)}.")
+            return
+
+        # Nunca programar una entrada que ya paso.
+        ahora = datetime.now(TZ)
+        if cuando <= ahora:
+            apertura = apertura_de(destino)
+            if apertura <= ahora:
+                resto = (f"Los cupos del {fecha_bonita(destino)} ya abrieron "
+                         f"({fecha_bonita(apertura)} a las {apertura:%H:%M}), asi que puedo "
+                         f"reservar de una. Escribeme:\n  {DIAS[destino.weekday()]} {h_clase}")
+            else:
+                resto = (f"Los cupos del {fecha_bonita(destino)} abren el "
+                         f"{fecha_bonita(apertura)} a las {apertura:%H:%M}. Escribeme:\n"
+                         f"  entra {dia_de_entrada(apertura, ahora)} {apertura:%H:%M} {h_clase}")
+            enviar(f"No puse la cita: {fecha_bonita(dia)} a las {h_entrada} ya paso "
+                   f"(ahora son las {ahora:%H:%M} del {fecha_bonita(ahora.date())}).\n\n{resto}")
             return
 
         poner_cita(estado, cuando, s_sug, clase, h_clase, destino)
