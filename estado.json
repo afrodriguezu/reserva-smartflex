@@ -1,13 +1,13 @@
 {
   "ultima_clase_reservada": 11,
-  "ultima_clase_vista": 1,
+  "ultima_clase_vista": 2,
   "subnivel": "A2.1",
   "ultimo_update_procesado": 349438684,
   "cita": null,
   "propuesta": {
     "subnivel": "A2.1",
-    "clase": "2",
-    "fecha": "2026-11-04",
-    "puesta": "2026-11-03 21:20"
+    "clase": "3",
+    "fecha": "2026-11-05",
+    "puesta": "2026-11-04 21:20"
   }
 }
